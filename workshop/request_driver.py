@@ -34,12 +34,12 @@ def resolve_jsonl_path(raw_value: str | None, fallback: Path) -> Path | None:
 
 DEFAULT_PROMPTS = [
     "Find one mug that works well for a clean desk setup and explain why it fits.",
-    "Add that mug to my cart.",
-    "yes",
-    "What is in my cart now?",
-    "Find one desk accessory that looks clean and minimalist for a home office.",
     "Compare the candle holder and the bamboo glass jar for a minimalist workspace.",
     "Suggest one giftable item for a calm desk setup and explain why it works.",
+    "Find one desk accessory that looks clean and minimalist for a home office.",
+    "Add that item to my cart.",
+    "yes",
+    "What is in my cart now?",
 ]
 
 
@@ -89,6 +89,16 @@ def warm_session(opener: urllib.request.OpenerDirector, base_url: str) -> None:
         return
 
 
+def unpack_response(payload: dict) -> tuple[str, list[str], bool]:
+    details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+    message = str(payload.get("message") or payload.get("content") or "").strip()
+    product_ids = payload.get("product_ids") or details.get("product_ids") or []
+    requires_confirmation = payload.get("requires_confirmation")
+    if requires_confirmation is None:
+        requires_confirmation = details.get("requires_confirmation", False)
+    return message, list(product_ids), bool(requires_confirmation)
+
+
 def send_prompt(
     opener: urllib.request.OpenerDirector,
     base_url: str,
@@ -108,6 +118,39 @@ def send_prompt(
         status = response.status
     latency_ms = round((time.perf_counter() - started) * 1000, 2)
     return status, json.loads(body.decode("utf-8")), latency_ms
+
+
+def wait_for_frontend_assistant(
+    base_url: str,
+    timeout_seconds: float = 180.0,
+    poll_seconds: float = 3.0,
+    probe_prompt: str = "Find one desk item that looks minimal and practical.",
+) -> None:
+    opener = make_opener()
+    deadline = time.monotonic() + timeout_seconds
+    last_error = "assistant warm-up did not complete"
+
+    while time.monotonic() < deadline:
+        try:
+            warm_session(opener, base_url)
+            status, payload, _latency_ms = send_prompt(
+                opener,
+                base_url,
+                probe_prompt,
+                timeout_seconds=max(30.0, poll_seconds * 10),
+            )
+            message, _product_ids, _requires_confirmation = unpack_response(payload)
+            if status == 200 and message:
+                return
+            last_error = f"status={status} message={message!r}"
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
+        time.sleep(max(1.0, poll_seconds))
+
+    raise TimeoutError(
+        "Timed out waiting for the storefront assistant path to return a visible response: "
+        f"{last_error}"
+    )
 
 
 def append_jsonl(path: Path, record: dict, lock: threading.Lock) -> None:
@@ -188,6 +231,7 @@ def worker(
                 prompt,
                 config.request_timeout_seconds,
             )
+            message, product_ids, requires_confirmation = unpack_response(payload)
             record = {
                 "timestamp": timestamp,
                 "worker_id": worker_id,
@@ -195,9 +239,9 @@ def worker(
                 "latency_ms": latency_ms,
                 "burst_active": burst_active,
                 "prompt": prompt,
-                "message": payload.get("message", ""),
-                "product_ids": payload.get("product_ids", []),
-                "requires_confirmation": payload.get("requires_confirmation", False),
+                "message": message,
+                "product_ids": product_ids,
+                "requires_confirmation": requires_confirmation,
             }
             print(
                 f"[worker {worker_id}] status={status} latency_ms={latency_ms} "
@@ -307,6 +351,13 @@ def main() -> int:
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
+
+    print(f"Waiting for storefront assistant readiness at {config.base_url} ...", flush=True)
+    wait_for_frontend_assistant(
+        config.base_url,
+        timeout_seconds=max(180.0, config.request_timeout_seconds),
+    )
+    print("Storefront assistant path is ready.", flush=True)
 
     print(
         f"Starting request driver against {config.base_url} "

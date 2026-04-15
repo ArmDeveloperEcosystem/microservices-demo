@@ -7,6 +7,7 @@ import argparse
 import json
 import subprocess
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,7 +33,7 @@ def append_jsonl(path: Path, record: dict) -> None:
         handle.write(json.dumps(record) + "\n")
 
 
-def collect_sample() -> dict:
+def collect_sample(namespace: str = "default") -> dict:
     timestamp = datetime.now(timezone.utc).isoformat()
     sample_epoch_ms = int(time.time() * 1000)
     pods = json.loads(
@@ -40,7 +41,8 @@ def collect_sample() -> dict:
             "kubectl",
             "get",
             "pods",
-            "-A",
+            "-n",
+            namespace,
             "-l",
             "app=shoppingassistantservice",
             "-o",
@@ -83,7 +85,8 @@ def collect_sample() -> dict:
         "kubectl",
         "top",
         "pod",
-        "-A",
+        "-n",
+        namespace,
         "-l",
         "app=shoppingassistantservice",
         "--containers",
@@ -94,15 +97,20 @@ def collect_sample() -> dict:
     c4a_cores = 0.0
     current_pool = "unknown"
     current_capacity_cores = 0.0
+    pod_pools: list[str] = []
 
     for line in top_output.splitlines():
         parts = line.split()
-        if len(parts) < 5:
+        if len(parts) >= 5:
+            namespace, pod_name, _container, cpu_raw, _memory = parts[:5]
+        elif len(parts) == 4:
+            pod_name, _container, cpu_raw, _memory = parts[:4]
+            namespace = namespace
+        else:
             continue
-        namespace, pod_name, _container, cpu_raw, _memory = parts[:5]
         info = pod_map.get((namespace, pod_name), {})
         pool = str(info.get("pool", "unknown"))
-        current_pool = pool
+        pod_pools.append(pool)
         current_capacity_cores = max(current_capacity_cores, float(info.get("capacity_cores", 0.0)))
         cpu_cores = cpu_to_cores(cpu_raw)
         if "n4a" in pool:
@@ -111,6 +119,14 @@ def collect_sample() -> dict:
             c4a_cores += cpu_cores
 
     total_cores = round(n4a_cores + c4a_cores, 4)
+    if n4a_cores > 0 and c4a_cores > 0:
+        current_pool = "mixed"
+    elif n4a_cores > 0:
+        current_pool = next((pool for pool in pod_pools if "n4a" in pool), "arm64-pool-n4a2")
+    elif c4a_cores > 0:
+        current_pool = next((pool for pool in pod_pools if "c4a" in pool), "arm64-pool-c4a")
+    elif pod_pools:
+        current_pool = Counter(pod_pools).most_common(1)[0][0]
     utilization_pct = round((total_cores / current_capacity_cores) * 100.0, 2) if current_capacity_cores else 0.0
 
     return {
@@ -130,6 +146,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--interval-seconds", type=float, default=2.0)
     parser.add_argument("--output-file", default=str(DEFAULT_OUTPUT_FILE))
+    parser.add_argument("--namespace", default="default")
     args = parser.parse_args()
 
     output_file = Path(args.output_file)
@@ -138,7 +155,7 @@ def main() -> int:
     try:
         while True:
             try:
-                sample = collect_sample()
+                sample = collect_sample(args.namespace)
             except Exception as exc:  # noqa: BLE001
                 sample = {
                     "timestamp": datetime.now(timezone.utc).isoformat(),

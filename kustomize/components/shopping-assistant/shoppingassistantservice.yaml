@@ -44,7 +44,7 @@ spec:
         - name: OLLAMA_URL
           value: http://127.0.0.1:11434/api/generate
         - name: MODEL_NAME
-          value: gemma3:1b
+          value: gemma3:1b-it-qat
         - name: SHOPPING_ASSISTANT_USER_ID
           value: workshop-user
       - name: ollama
@@ -62,7 +62,7 @@ spec:
         - name: OLLAMA_NUM_PARALLEL
           value: "2"
         - name: OLLAMA_MODEL
-          value: gemma3:1b
+          value: gemma3:1b-it-qat
         command:
         - /bin/sh
         - -c

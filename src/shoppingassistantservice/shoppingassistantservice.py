@@ -19,7 +19,7 @@ PRODUCT_CATALOG_SERVICE_ADDR = os.getenv(
 CART_SERVICE_ADDR = os.getenv("CART_SERVICE_ADDR", "cartservice:7070")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
 OLLAMA_TAGS_URL = os.getenv("OLLAMA_TAGS_URL", "http://127.0.0.1:11434/api/tags")
-MODEL_NAME = os.getenv("MODEL_NAME", "gemma3:1b")
+MODEL_NAME = os.getenv("MODEL_NAME", "gemma3:1b-it-qat")
 USER_ID = os.getenv("SHOPPING_ASSISTANT_USER_ID", "workshop-user")
 
 catalog_stub = demo_pb2_grpc.ProductCatalogServiceStub(
@@ -29,6 +29,7 @@ cart_stub = demo_pb2_grpc.CartServiceStub(grpc.insecure_channel(CART_SERVICE_ADD
 
 pending_actions = {}
 recent_results = {}
+recent_actions = {}
 
 
 def money_to_string(money):
@@ -67,6 +68,10 @@ def respond(content, product_ids=None, requires_confirmation=False):
     )
 
 
+def record_action(session_id, action, detail):
+    recent_actions[session_id] = {"action": action, "detail": detail}
+
+
 def model_ready():
     request_obj = urllib.request.Request(OLLAMA_TAGS_URL, method="GET")
     with urllib.request.urlopen(request_obj, timeout=5) as response:
@@ -101,23 +106,25 @@ def search_catalog(query):
     return [product_to_dict(product) for product in products[:3]]
 
 
-def get_cart_contents():
+def get_product_details(product_id):
+    try:
+        product = catalog_stub.GetProduct(demo_pb2.GetProductRequest(id=product_id))
+        return product_to_dict(product)
+    except grpc.RpcError:
+        return None
+
+
+def get_cart():
     cart = cart_stub.GetCart(demo_pb2.GetCartRequest(user_id=USER_ID))
     summary = []
     for item in cart.items:
-        product_name = item.product_id
-        try:
-            product = catalog_stub.GetProduct(
-                demo_pb2.GetProductRequest(id=item.product_id)
-            )
-            product_name = product.name
-        except grpc.RpcError:
-            pass
+        product = get_product_details(item.product_id)
         summary.append(
             {
                 "product_id": item.product_id,
-                "name": product_name,
+                "name": product["name"] if product else item.product_id,
                 "quantity": item.quantity,
+                "price": product["price"] if product else None,
             }
         )
     return summary
@@ -172,6 +179,119 @@ def current_session_id():
     )
 
 
+def normalize_message(payload):
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("message", "")).strip()
+
+
+def get_tool_summary(matches):
+    return json.dumps(
+        {
+            "matching_products": matches,
+            "cart": get_cart(),
+        },
+        indent=2,
+    )
+
+
+def handle_confirmation(session_id, lowered):
+    if lowered not in {"yes", "yes please", "confirm"}:
+        return None
+    if session_id not in pending_actions:
+        return respond("I do not have a pending cart action to confirm right now.")
+
+    action = pending_actions.pop(session_id)
+    result = add_to_cart(action["product_id"], action["quantity"])
+    record_action(session_id, "add_to_cart", action["product_id"])
+    return respond(
+        f"Added {result['quantity']} x {action['name']} to your cart.",
+        [result["product_id"]],
+        False,
+    )
+
+
+def handle_cart_query(session_id, lowered):
+    if "add" in lowered and "cart" in lowered:
+        return None
+
+    if not any(
+        phrase in lowered
+        for phrase in {"what is in my cart", "show my cart", "cart now", "view my cart"}
+    ):
+        return None
+
+    cart_items = get_cart()
+    record_action(session_id, "get_cart", f"{len(cart_items)} items")
+    if not cart_items:
+        return respond("Your cart is empty right now.")
+
+    cart_message = "; ".join(f"{item['quantity']} x {item['name']}" for item in cart_items)
+    return respond(
+        f"Your cart currently contains: {cart_message}.",
+        [item["product_id"] for item in cart_items],
+        False,
+    )
+
+
+def choose_catalog_candidate(user_input, session_id):
+    candidates = recent_results.get(session_id)
+    if candidates:
+        return candidates[0], candidates
+
+    matches = search_catalog(user_input)
+    recent_results[session_id] = matches
+    return (matches[0], matches) if matches else (None, [])
+
+
+def handle_add_to_cart_intent(session_id, user_input, lowered):
+    if "add" not in lowered or "cart" not in lowered:
+        return None
+
+    selected, candidates = choose_catalog_candidate(user_input, session_id)
+    if not selected:
+        return respond(
+            "I could not identify which product to add. Ask me to find an item first."
+        )
+
+    details = get_product_details(selected["id"]) or selected
+    pending_actions[session_id] = {
+        "product_id": details["id"],
+        "name": details["name"],
+        "quantity": 1,
+    }
+    record_action(session_id, "prepare_add_to_cart", details["id"])
+    return respond(
+        (
+            f"I found {details['name']} for {details['price']}. "
+            "Reply yes to confirm adding it to your cart."
+        ),
+        [details["id"]],
+        True,
+    )
+
+
+def handle_search_or_recommendation(session_id, user_input):
+    matches = search_catalog(user_input)
+    recent_results[session_id] = matches
+    record_action(session_id, "search_catalog", user_input)
+
+    if not matches:
+        return respond("I could not find a matching product in the live catalog.")
+
+    try:
+        answer = call_model(user_input, get_tool_summary(matches))
+        record_action(session_id, "call_model", MODEL_NAME)
+    except Exception:
+        top = matches[0]
+        answer = (
+            f"I found {top['name']} for {top['price']}. "
+            "Ask me to add it to your cart if you want it."
+        )
+
+    return respond(answer, [item["id"] for item in matches], False)
+
+
 @app.get("/healthz")
 def healthz():
     return jsonify({"ok": True, "service": "shoppingassistantservice"})
@@ -191,77 +311,26 @@ def readyz():
 @app.post("/bot")
 def bot():
     payload = request.get_json(force=True)
-    user_input = payload.get("message", "").strip()
+    user_input = normalize_message(payload)
     session_id = current_session_id()
 
     if not user_input:
         return respond("Please enter a shopping question.")
 
     lowered = user_input.lower()
+    confirmation_response = handle_confirmation(session_id, lowered)
+    if confirmation_response is not None:
+        return confirmation_response
 
-    if lowered in {"yes", "yes please", "confirm"} and session_id in pending_actions:
-        action = pending_actions.pop(session_id)
-        result = add_to_cart(action["product_id"], action["quantity"])
-        return respond(
-            f"Added {result['quantity']} x {action['name']} to your cart.",
-            [result["product_id"]],
-            False,
-        )
+    cart_response = handle_cart_query(session_id, lowered)
+    if cart_response is not None:
+        return cart_response
 
-    if any(phrase in lowered for phrase in ["what is in my cart", "show my cart", "cart now"]):
-        cart_items = get_cart_contents()
-        if not cart_items:
-            return respond("Your cart is empty right now.")
-        cart_message = "; ".join(
-            f"{item['quantity']} x {item['name']}" for item in cart_items
-        )
-        return respond(
-            f"Your cart currently contains: {cart_message}.",
-            [item["product_id"] for item in cart_items],
-            False,
-        )
+    add_response = handle_add_to_cart_intent(session_id, user_input, lowered)
+    if add_response is not None:
+        return add_response
 
-    if "add" in lowered and "cart" in lowered:
-        candidates = recent_results.get(session_id) or search_catalog(user_input)
-        if not candidates:
-            return respond(
-                "I could not identify which product to add. Ask me to find an item first."
-            )
-        selected = candidates[0]
-        pending_actions[session_id] = {
-            "product_id": selected["id"],
-            "name": selected["name"],
-            "quantity": 1,
-        }
-        return respond(
-            f"I found {selected['name']} for {selected['price']}. Reply yes to confirm adding it to your cart.",
-            [selected["id"]],
-            True,
-        )
-
-    matches = search_catalog(user_input)
-    recent_results[session_id] = matches
-
-    if not matches:
-        return respond("I could not find a matching product in the live catalog.")
-
-    tool_summary = json.dumps(
-        {
-            "matching_products": matches,
-            "cart": get_cart_contents(),
-        },
-        indent=2,
-    )
-
-    try:
-        answer = call_model(user_input, tool_summary)
-    except Exception:
-        top = matches[0]
-        answer = (
-            f"I found {top['name']} for {top['price']}. Ask me to add it to your cart if you want it."
-        )
-
-    return respond(answer, [item["id"] for item in matches], False)
+    return handle_search_or_recommendation(session_id, user_input)
 
 
 if __name__ == "__main__":

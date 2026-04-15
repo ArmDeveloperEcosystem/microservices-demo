@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import threading
 import time
 import urllib.error
@@ -18,6 +19,8 @@ from request_driver import (
     make_opener,
     require_base_url,
     send_prompt,
+    unpack_response,
+    wait_for_frontend_assistant,
     warm_session,
 )
 from telemetry_collector import append_jsonl, collect_sample
@@ -26,6 +29,7 @@ from telemetry_collector import append_jsonl, collect_sample
 @dataclass
 class TrialConfig:
     base_url: str
+    namespace: str
     concurrency: int
     prompts_per_worker: int
     delay_seconds: float
@@ -34,6 +38,7 @@ class TrialConfig:
     idle_threshold_cores: float
     idle_stable_samples: int
     idle_timeout_seconds: float
+    expected_pool: str | None
     request_output_file: Path | None
     telemetry_output_file: Path | None
 
@@ -79,6 +84,7 @@ def request_worker(
                 prompt,
                 config.request_timeout_seconds,
             )
+            message, product_ids, requires_confirmation = unpack_response(payload)
             record = {
                 "timestamp": timestamp,
                 "worker_id": worker_id,
@@ -86,9 +92,9 @@ def request_worker(
                 "status": status,
                 "latency_ms": latency_ms,
                 "prompt": prompt,
-                "message": payload.get("message", ""),
-                "product_ids": payload.get("product_ids", []),
-                "requires_confirmation": payload.get("requires_confirmation", False),
+                "message": message,
+                "product_ids": product_ids,
+                "requires_confirmation": requires_confirmation,
             }
             print(
                 f"[worker {worker_id}] status={status} latency_ms={latency_ms} "
@@ -140,7 +146,7 @@ def telemetry_loop(
 ) -> None:
     while not stop_event.is_set():
         try:
-            sample = collect_sample()
+            sample = collect_sample(config.namespace)
         except Exception as exc:  # noqa: BLE001
             sample = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -176,9 +182,71 @@ def is_idle_sequence(samples: list[dict], threshold: float, stable_count: int, a
     return all(float(s.get("total_cores", 0.0)) <= threshold for s in tail)
 
 
+def wait_for_expected_pool(
+    expected_pool: str,
+    namespace: str,
+    timeout_seconds: float = 240.0,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    last_seen = "no assistant pod found"
+
+    while time.monotonic() < deadline:
+        raw = subprocess.check_output(
+            [
+                "kubectl",
+                "get",
+                "pods",
+                "-n",
+                namespace,
+                "-l",
+                "app=shoppingassistantservice",
+                "-o",
+                "json",
+            ],
+            text=True,
+        )
+        items = json.loads(raw).get("items", [])
+        ready_pools: list[str] = []
+
+        for pod in items:
+            metadata = pod.get("metadata", {})
+            spec = pod.get("spec", {})
+            status = pod.get("status", {})
+            phase = status.get("phase")
+            if phase != "Running":
+                continue
+            container_statuses = status.get("containerStatuses", [])
+            if not container_statuses or not all(cs.get("ready") for cs in container_statuses):
+                continue
+            node_name = spec.get("nodeName")
+            if not node_name:
+                continue
+            node = json.loads(
+                subprocess.check_output(["kubectl", "get", "node", node_name, "-o", "json"], text=True)
+            )
+            pool = (
+                node.get("metadata", {})
+                .get("labels", {})
+                .get("cloud.google.com/gke-nodepool", node_name)
+            )
+            ready_pools.append(pool)
+
+        if len(ready_pools) == 1 and ready_pools[0] == expected_pool:
+            return
+        if ready_pools:
+            last_seen = ",".join(ready_pools)
+        time.sleep(2.0)
+
+    raise TimeoutError(
+        f"Timed out waiting for shoppingassistantservice to settle on {expected_pool!r}; "
+        f"last ready pool view was {last_seen!r}"
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", required=True, help="Frontend base URL.")
+    parser.add_argument("--namespace", default="default", help="Namespace containing shoppingassistantservice.")
     parser.add_argument("--concurrency", type=int, default=2, help="Number of worker sessions.")
     parser.add_argument(
         "--prompts-per-worker",
@@ -223,6 +291,11 @@ def main() -> int:
         help="How long to wait after the batch for the system to return to idle.",
     )
     parser.add_argument(
+        "--expected-pool",
+        default="",
+        help="Optional node pool that shoppingassistantservice must settle on before the batch starts.",
+    )
+    parser.add_argument(
         "--request-output-file",
         default="workshop/request-fixed-batch.jsonl",
         help="Optional JSONL file for request records. Use 'off' to disable.",
@@ -236,6 +309,7 @@ def main() -> int:
 
     config = TrialConfig(
         base_url=require_base_url(args.base_url, parser),
+        namespace=(args.namespace or "default").strip() or "default",
         concurrency=max(1, args.concurrency),
         prompts_per_worker=max(1, args.prompts_per_worker),
         delay_seconds=max(0.0, args.delay_seconds),
@@ -244,6 +318,7 @@ def main() -> int:
         idle_threshold_cores=max(0.0, args.idle_threshold_cores),
         idle_stable_samples=max(1, args.idle_stable_samples),
         idle_timeout_seconds=max(5.0, args.idle_timeout_seconds),
+        expected_pool=(args.expected_pool or "").strip() or None,
         request_output_file=resolve_output_path(args.request_output_file),
         telemetry_output_file=resolve_output_path(args.telemetry_output_file),
     )
@@ -260,6 +335,24 @@ def main() -> int:
     if config.telemetry_output_file:
         config.telemetry_output_file.parent.mkdir(parents=True, exist_ok=True)
         config.telemetry_output_file.write_text("", encoding="utf-8")
+
+    print(f"Waiting for storefront assistant readiness at {config.base_url} ...", flush=True)
+    wait_for_frontend_assistant(
+        config.base_url,
+        timeout_seconds=max(240.0, config.request_timeout_seconds * 2),
+    )
+    if config.expected_pool:
+        print(
+            f"Waiting for shoppingassistantservice to settle on {config.expected_pool} ...",
+            flush=True,
+        )
+        wait_for_expected_pool(
+            config.expected_pool,
+            config.namespace,
+            timeout_seconds=max(240.0, config.idle_timeout_seconds),
+        )
+        print(f"shoppingassistantservice is ready on {config.expected_pool}.", flush=True)
+    print("Storefront assistant path is ready. Starting fixed batch telemetry.", flush=True)
 
     telemetry_thread = threading.Thread(
         target=telemetry_loop,
