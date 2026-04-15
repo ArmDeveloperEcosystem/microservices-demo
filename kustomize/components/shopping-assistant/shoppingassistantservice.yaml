@@ -1,17 +1,3 @@
-# Copyright 2024 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -28,49 +14,70 @@ spec:
         app: shoppingassistantservice
     spec:
       serviceAccountName: shoppingassistantservice
-      terminationGracePeriodSeconds: 5
-      securityContext:
-        fsGroup: 1000
-        runAsGroup: 1000
-        runAsNonRoot: true
-        runAsUser: 1000
+      terminationGracePeriodSeconds: 10
+      volumes:
+      - name: ollama-models
+        emptyDir: {}
       containers:
       - name: server
-        securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-              - ALL
-          privileged: false
-          readOnlyRootFilesystem: false
-        image: shoppingassistantservice
+        image: shoppingassistantservice:dev
         ports:
         - name: http
           containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 20
         env:
-        - name: GOOGLE_API_KEY
-          value: GOOGLE_API_KEY_VAL
-        - name: ALLOYDB_CLUSTER_NAME
-          value: ALLOYDB_CLUSTER_NAME_VAL
-        - name: ALLOYDB_INSTANCE_NAME
-          value: ALLOYDB_INSTANCE_NAME_VAL
-        - name: ALLOYDB_DATABASE_NAME
-          value: ALLOYDB_DATABASE_NAME_VAL
-        - name: ALLOYDB_TABLE_NAME
-          value: ALLOYDB_TABLE_NAME_VAL
-        - name: ALLOYDB_SECRET_NAME
-          value: ALLOYDB_SECRET_NAME_VAL
-        - name: PROJECT_ID
-          value: PROJECT_ID_VAL
-        - name: REGION
-          value: REGION_VAL
-        resources:
-          requests:
-            cpu: 100m
-            memory: 64Mi
-          limits:
-            cpu: 200m
-            memory: 128Mi
+        - name: PRODUCT_CATALOG_SERVICE_ADDR
+          value: productcatalogservice:3550
+        - name: CART_SERVICE_ADDR
+          value: cartservice:7070
+        - name: OLLAMA_URL
+          value: http://127.0.0.1:11434/api/generate
+        - name: MODEL_NAME
+          value: gemma2:9b
+        - name: SHOPPING_ASSISTANT_USER_ID
+          value: workshop-user
+      - name: ollama
+        image: ollama/ollama:0.12.3
+        ports:
+        - name: ollama
+          containerPort: 11434
+        env:
+        - name: OLLAMA_HOST
+          value: 0.0.0.0:11434
+        - name: OLLAMA_MODELS
+          value: /models
+        - name: OLLAMA_KEEP_ALIVE
+          value: 24h
+        - name: OLLAMA_NUM_PARALLEL
+          value: "2"
+        - name: OLLAMA_MODEL
+          value: gemma2:9b
+        command:
+        - /bin/sh
+        - -c
+        args:
+        - |
+          ollama serve &
+          pid=$!
+          until ollama list >/dev/null 2>&1; do
+            sleep 2
+          done
+          ollama pull "${OLLAMA_MODEL}"
+          wait "$pid"
+        volumeMounts:
+        - name: ollama-models
+          mountPath: /models
 ---
 apiVersion: v1
 kind: Service
@@ -79,7 +86,6 @@ metadata:
   labels:
     app: shoppingassistantservice
 spec:
-  type: ClusterIP
   selector:
     app: shoppingassistantservice
   ports:
@@ -91,5 +97,3 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: shoppingassistantservice
-  annotations:
-    iam.gke.io/gcp-service-account: ALLOYDB_USER_GSA_ID

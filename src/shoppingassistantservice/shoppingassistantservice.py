@@ -1,120 +1,267 @@
-#!/usr/bin/python
-#
-# Copyright 2024 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
+#!/usr/bin/env python3
+import json
 import os
+import re
+import urllib.request
 
-from google.cloud import secretmanager_v1
-from urllib.parse import unquote
-from langchain_core.messages import HumanMessage
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from flask import Flask, request
+import grpc
+from flask import Flask, jsonify, request
 
-from langchain_google_alloydb_pg import AlloyDBEngine, AlloyDBVectorStore
+import demo_pb2
+import demo_pb2_grpc
 
-PROJECT_ID = os.environ["PROJECT_ID"]
-REGION = os.environ["REGION"]
-ALLOYDB_DATABASE_NAME = os.environ["ALLOYDB_DATABASE_NAME"]
-ALLOYDB_TABLE_NAME = os.environ["ALLOYDB_TABLE_NAME"]
-ALLOYDB_CLUSTER_NAME = os.environ["ALLOYDB_CLUSTER_NAME"]
-ALLOYDB_INSTANCE_NAME = os.environ["ALLOYDB_INSTANCE_NAME"]
-ALLOYDB_SECRET_NAME = os.environ["ALLOYDB_SECRET_NAME"]
+app = Flask(__name__)
 
-secret_manager_client = secretmanager_v1.SecretManagerServiceClient()
-secret_name = secret_manager_client.secret_version_path(project=PROJECT_ID, secret=ALLOYDB_SECRET_NAME, secret_version="latest")
-secret_request = secretmanager_v1.AccessSecretVersionRequest(name=secret_name)
-secret_response = secret_manager_client.access_secret_version(request=secret_request)
-PGPASSWORD = secret_response.payload.data.decode("UTF-8").strip()
-
-engine = AlloyDBEngine.from_instance(
-    project_id=PROJECT_ID,
-    region=REGION,
-    cluster=ALLOYDB_CLUSTER_NAME,
-    instance=ALLOYDB_INSTANCE_NAME,
-    database=ALLOYDB_DATABASE_NAME,
-    user="postgres",
-    password=PGPASSWORD
+PRODUCT_CATALOG_SERVICE_ADDR = os.getenv(
+    "PRODUCT_CATALOG_SERVICE_ADDR", "productcatalogservice:3550"
 )
+CART_SERVICE_ADDR = os.getenv("CART_SERVICE_ADDR", "cartservice:7070")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
+MODEL_NAME = os.getenv("MODEL_NAME", "gemma2:9b")
+USER_ID = os.getenv("SHOPPING_ASSISTANT_USER_ID", "workshop-user")
 
-# Create a synchronous connection to our vectorstore
-vectorstore = AlloyDBVectorStore.create_sync(
-    engine=engine,
-    table_name=ALLOYDB_TABLE_NAME,
-    embedding_service=GoogleGenerativeAIEmbeddings(model="models/embedding-001"),
-    id_column="id",
-    content_column="description",
-    embedding_column="product_embedding",
-    metadata_columns=["id", "name", "categories"]
+catalog_stub = demo_pb2_grpc.ProductCatalogServiceStub(
+    grpc.insecure_channel(PRODUCT_CATALOG_SERVICE_ADDR)
 )
+cart_stub = demo_pb2_grpc.CartServiceStub(grpc.insecure_channel(CART_SERVICE_ADDR))
 
-def create_app():
-    app = Flask(__name__)
+pending_actions = {}
+recent_results = {}
 
-    @app.route("/", methods=['POST'])
-    def talkToGemini():
-        print("Beginning RAG call")
-        prompt = request.json['message']
-        prompt = unquote(prompt)
 
-        # Step 1 – Get a room description from Gemini-vision-pro
-        llm_vision = ChatGoogleGenerativeAI(model="gemini-1.5-flash")
-        message = HumanMessage(
-            content=[
+def money_to_string(money):
+    units = int(money.units)
+    cents = abs(int(money.nanos)) // 10_000_000
+    return f"${units}.{cents:02d}"
+
+
+def product_to_dict(product):
+    return {
+        "id": product.id,
+        "name": product.name,
+        "description": " ".join(product.description.split())[:160],
+        "price": money_to_string(product.price_usd),
+        "categories": list(product.categories),
+    }
+
+
+def search_catalog(query):
+    try:
+        response = catalog_stub.SearchProducts(
+            demo_pb2.SearchProductsRequest(query=query)
+        )
+        products = list(response.results)
+    except grpc.RpcError:
+        products = []
+
+    if not products:
+        all_products = catalog_stub.ListProducts(demo_pb2.Empty()).products
+        terms = re.findall(r"[a-z0-9]+", query.lower())
+        scored = []
+        for product in all_products:
+            haystack = " ".join(
+                [product.name, product.description, " ".join(product.categories)]
+            ).lower()
+            score = sum(haystack.count(term) for term in terms)
+            if score > 0:
+                scored.append((score, product))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        products = [product for _, product in scored[:3]]
+
+    return [product_to_dict(product) for product in products[:3]]
+
+
+def get_cart_contents():
+    cart = cart_stub.GetCart(demo_pb2.GetCartRequest(user_id=USER_ID))
+    summary = []
+    for item in cart.items:
+        product_name = item.product_id
+        try:
+            product = catalog_stub.GetProduct(
+                demo_pb2.GetProductRequest(id=item.product_id)
+            )
+            product_name = product.name
+        except grpc.RpcError:
+            pass
+        summary.append(
+            {
+                "product_id": item.product_id,
+                "name": product_name,
+                "quantity": item.quantity,
+            }
+        )
+    return summary
+
+
+def add_to_cart(product_id, quantity=1):
+    cart_stub.AddItem(
+        demo_pb2.AddItemRequest(
+            user_id=USER_ID,
+            item=demo_pb2.CartItem(product_id=product_id, quantity=quantity),
+        )
+    )
+    return {"product_id": product_id, "quantity": quantity}
+
+
+def call_model(user_prompt, tool_summary):
+    prompt = f"""
+You are a helpful shopping assistant for the Cymbal Shops storefront.
+Use the tool results below to answer clearly and briefly.
+Do not invent product IDs or prices.
+
+User request:
+{user_prompt}
+
+Tool results:
+{tool_summary}
+""".strip()
+
+    payload = json.dumps(
+        {
+            "model": MODEL_NAME,
+            "prompt": prompt,
+            "stream": False,
+        }
+    ).encode("utf-8")
+    request_obj = urllib.request.Request(
+        OLLAMA_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request_obj, timeout=180) as response:
+        body = json.loads(response.read().decode("utf-8"))
+    return body.get("response", "").strip()
+
+
+def current_session_id():
+    return (
+        request.cookies.get("shop_session-id")
+        or request.headers.get("X-Session-Id")
+        or "workshop-session"
+    )
+
+
+@app.get("/healthz")
+def healthz():
+    return jsonify({"ok": True, "service": "shoppingassistantservice"})
+
+
+@app.post("/bot")
+def bot():
+    payload = request.get_json(force=True)
+    user_input = payload.get("message", "").strip()
+    session_id = current_session_id()
+
+    if not user_input:
+        return jsonify(
+            {
+                "message": "Please enter a shopping question.",
+                "product_ids": [],
+                "requires_confirmation": False,
+            }
+        )
+
+    lowered = user_input.lower()
+
+    if lowered in {"yes", "yes please", "confirm"} and session_id in pending_actions:
+        action = pending_actions.pop(session_id)
+        result = add_to_cart(action["product_id"], action["quantity"])
+        return jsonify(
+            {
+                "message": f"Added {result['quantity']} x {action['name']} to your cart.",
+                "product_ids": [result["product_id"]],
+                "requires_confirmation": False,
+            }
+        )
+
+    if any(
+        phrase in lowered for phrase in ["what is in my cart", "show my cart", "cart now"]
+    ):
+        cart_items = get_cart_contents()
+        if not cart_items:
+            return jsonify(
                 {
-                    "type": "text",
-                    "text": "You are a professional interior designer, give me a detailed decsription of the style of the room in this image",
-                },
-                {"type": "image_url", "image_url": request.json['image']},
-            ]
+                    "message": "Your cart is empty right now.",
+                    "product_ids": [],
+                    "requires_confirmation": False,
+                }
+            )
+        cart_message = "; ".join(
+            f"{item['quantity']} x {item['name']}" for item in cart_items
         )
-        response = llm_vision.invoke([message])
-        print("Description step:")
-        print(response)
-        description_response = response.content
-
-        # Step 2 – Similarity search with the description & user prompt
-        vector_search_prompt = f""" This is the user's request: {prompt} Find the most relevant items for that prompt, while matching style of the room described here: {description_response} """
-        print(vector_search_prompt)
-
-        docs = vectorstore.similarity_search(vector_search_prompt)
-        print(f"Vector search: {description_response}")
-        print(f"Retrieved documents: {len(docs)}")
-        #Prepare relevant documents for inclusion in final prompt
-        relevant_docs = ""
-        for doc in docs:
-            doc_details = doc.to_json()
-            print(f"Adding relevant document to prompt context: {doc_details}")
-            relevant_docs += str(doc_details) + ", "
-
-        # Step 3 – Tie it all together by augmenting our call to Gemini-pro
-        llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash")
-        design_prompt = (
-            f" You are an interior designer that works for Online Boutique. You are tasked with providing recommendations to a customer on what they should add to a given room from our catalog. This is the description of the room: \n"
-            f"{description_response} Here are a list of products that are relevant to it: {relevant_docs} Specifically, this is what the customer has asked for, see if you can accommodate it: {prompt} Start by repeating a brief description of the room's design to the customer, then provide your recommendations. Do your best to pick the most relevant item out of the list of products provided, but if none of them seem relevant, then say that instead of inventing a new product. At the end of the response, add a list of the IDs of the relevant products in the following format for the top 3 results: [<first product ID>], [<second product ID>], [<third product ID>] ")
-        print("Final design prompt: ")
-        print(design_prompt)
-        design_response = llm.invoke(
-            design_prompt
+        return jsonify(
+            {
+                "message": f"Your cart currently contains: {cart_message}.",
+                "product_ids": [item["product_id"] for item in cart_items],
+                "requires_confirmation": False,
+            }
         )
 
-        data = {'content': design_response.content}
-        return data
+    if "add" in lowered and "cart" in lowered:
+        candidates = recent_results.get(session_id) or search_catalog(user_input)
+        if not candidates:
+            return jsonify(
+                {
+                    "message": "I could not identify which product to add. Ask me to find an item first.",
+                    "product_ids": [],
+                    "requires_confirmation": False,
+                }
+            )
+        selected = candidates[0]
+        pending_actions[session_id] = {
+            "product_id": selected["id"],
+            "name": selected["name"],
+            "quantity": 1,
+        }
+        return jsonify(
+            {
+                "message": (
+                    f"I found {selected['name']} for {selected['price']}. "
+                    "Reply yes to confirm adding it to your cart."
+                ),
+                "product_ids": [selected["id"]],
+                "requires_confirmation": True,
+            }
+        )
 
-    return app
+    matches = search_catalog(user_input)
+    recent_results[session_id] = matches
+
+    if not matches:
+        return jsonify(
+            {
+                "message": "I could not find a matching product in the live catalog.",
+                "product_ids": [],
+                "requires_confirmation": False,
+            }
+        )
+
+    tool_summary = json.dumps(
+        {
+            "matching_products": matches,
+            "cart": get_cart_contents(),
+        },
+        indent=2,
+    )
+
+    try:
+        answer = call_model(user_input, tool_summary)
+    except Exception:
+        top = matches[0]
+        answer = (
+            f"I found {top['name']} for {top['price']}. "
+            "Ask me to add it to your cart if you want it."
+        )
+
+    return jsonify(
+        {
+            "message": answer,
+            "product_ids": [item["id"] for item in matches],
+            "requires_confirmation": False,
+        }
+    )
+
 
 if __name__ == "__main__":
-    # Create an instance of flask server when called directly
-    app = create_app()
-    app.run(host='0.0.0.0', port=8080)
+    app.run(host="0.0.0.0", port=8080)
