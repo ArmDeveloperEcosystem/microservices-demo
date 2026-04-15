@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import urllib.error
 import urllib.request
 
 import grpc
@@ -17,7 +18,8 @@ PRODUCT_CATALOG_SERVICE_ADDR = os.getenv(
 )
 CART_SERVICE_ADDR = os.getenv("CART_SERVICE_ADDR", "cartservice:7070")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
-MODEL_NAME = os.getenv("MODEL_NAME", "gemma2:9b")
+OLLAMA_TAGS_URL = os.getenv("OLLAMA_TAGS_URL", "http://127.0.0.1:11434/api/tags")
+MODEL_NAME = os.getenv("MODEL_NAME", "gemma3:1b")
 USER_ID = os.getenv("SHOPPING_ASSISTANT_USER_ID", "workshop-user")
 
 catalog_stub = demo_pb2_grpc.ProductCatalogServiceStub(
@@ -43,6 +45,34 @@ def product_to_dict(product):
         "price": money_to_string(product.price_usd),
         "categories": list(product.categories),
     }
+
+
+def ids_suffix(product_ids):
+    if not product_ids:
+        return ""
+    return " Relevant products: " + " ".join(f"[{product_id}]" for product_id in product_ids)
+
+
+def respond(content, product_ids=None, requires_confirmation=False):
+    product_ids = product_ids or []
+    message = content + ids_suffix(product_ids)
+    return jsonify(
+        {
+            "content": message,
+            "details": {
+                "product_ids": product_ids,
+                "requires_confirmation": requires_confirmation,
+            },
+        }
+    )
+
+
+def model_ready():
+    request_obj = urllib.request.Request(OLLAMA_TAGS_URL, method="GET")
+    with urllib.request.urlopen(request_obj, timeout=5) as response:
+        body = json.loads(response.read().decode("utf-8"))
+    names = {item.get("name", "") for item in body.get("models", [])}
+    return MODEL_NAME in names
 
 
 def search_catalog(query):
@@ -147,6 +177,17 @@ def healthz():
     return jsonify({"ok": True, "service": "shoppingassistantservice"})
 
 
+@app.get("/readyz")
+def readyz():
+    try:
+        if model_ready():
+            return jsonify({"ok": True, "model": MODEL_NAME})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": str(exc)}), 503
+    return jsonify({"ok": False, "model": MODEL_NAME, "status": "loading"}), 503
+
+
+@app.post("/")
 @app.post("/bot")
 def bot():
     payload = request.get_json(force=True)
@@ -154,59 +195,37 @@ def bot():
     session_id = current_session_id()
 
     if not user_input:
-        return jsonify(
-            {
-                "message": "Please enter a shopping question.",
-                "product_ids": [],
-                "requires_confirmation": False,
-            }
-        )
+        return respond("Please enter a shopping question.")
 
     lowered = user_input.lower()
 
     if lowered in {"yes", "yes please", "confirm"} and session_id in pending_actions:
         action = pending_actions.pop(session_id)
         result = add_to_cart(action["product_id"], action["quantity"])
-        return jsonify(
-            {
-                "message": f"Added {result['quantity']} x {action['name']} to your cart.",
-                "product_ids": [result["product_id"]],
-                "requires_confirmation": False,
-            }
+        return respond(
+            f"Added {result['quantity']} x {action['name']} to your cart.",
+            [result["product_id"]],
+            False,
         )
 
-    if any(
-        phrase in lowered for phrase in ["what is in my cart", "show my cart", "cart now"]
-    ):
+    if any(phrase in lowered for phrase in ["what is in my cart", "show my cart", "cart now"]):
         cart_items = get_cart_contents()
         if not cart_items:
-            return jsonify(
-                {
-                    "message": "Your cart is empty right now.",
-                    "product_ids": [],
-                    "requires_confirmation": False,
-                }
-            )
+            return respond("Your cart is empty right now.")
         cart_message = "; ".join(
             f"{item['quantity']} x {item['name']}" for item in cart_items
         )
-        return jsonify(
-            {
-                "message": f"Your cart currently contains: {cart_message}.",
-                "product_ids": [item["product_id"] for item in cart_items],
-                "requires_confirmation": False,
-            }
+        return respond(
+            f"Your cart currently contains: {cart_message}.",
+            [item["product_id"] for item in cart_items],
+            False,
         )
 
     if "add" in lowered and "cart" in lowered:
         candidates = recent_results.get(session_id) or search_catalog(user_input)
         if not candidates:
-            return jsonify(
-                {
-                    "message": "I could not identify which product to add. Ask me to find an item first.",
-                    "product_ids": [],
-                    "requires_confirmation": False,
-                }
+            return respond(
+                "I could not identify which product to add. Ask me to find an item first."
             )
         selected = candidates[0]
         pending_actions[session_id] = {
@@ -214,28 +233,17 @@ def bot():
             "name": selected["name"],
             "quantity": 1,
         }
-        return jsonify(
-            {
-                "message": (
-                    f"I found {selected['name']} for {selected['price']}. "
-                    "Reply yes to confirm adding it to your cart."
-                ),
-                "product_ids": [selected["id"]],
-                "requires_confirmation": True,
-            }
+        return respond(
+            f"I found {selected['name']} for {selected['price']}. Reply yes to confirm adding it to your cart.",
+            [selected["id"]],
+            True,
         )
 
     matches = search_catalog(user_input)
     recent_results[session_id] = matches
 
     if not matches:
-        return jsonify(
-            {
-                "message": "I could not find a matching product in the live catalog.",
-                "product_ids": [],
-                "requires_confirmation": False,
-            }
-        )
+        return respond("I could not find a matching product in the live catalog.")
 
     tool_summary = json.dumps(
         {
@@ -250,17 +258,10 @@ def bot():
     except Exception:
         top = matches[0]
         answer = (
-            f"I found {top['name']} for {top['price']}. "
-            "Ask me to add it to your cart if you want it."
+            f"I found {top['name']} for {top['price']}. Ask me to add it to your cart if you want it."
         )
 
-    return jsonify(
-        {
-            "message": answer,
-            "product_ids": [item["id"] for item in matches],
-            "requires_confirmation": False,
-        }
-    )
+    return respond(answer, [item["id"] for item in matches], False)
 
 
 if __name__ == "__main__":

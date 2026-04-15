@@ -26,7 +26,7 @@ spec:
           containerPort: 8080
         readinessProbe:
           httpGet:
-            path: /healthz
+            path: /readyz
             port: 8080
           initialDelaySeconds: 15
           periodSeconds: 10
@@ -44,7 +44,7 @@ spec:
         - name: OLLAMA_URL
           value: http://127.0.0.1:11434/api/generate
         - name: MODEL_NAME
-          value: gemma2:9b
+          value: gemma3:1b
         - name: SHOPPING_ASSISTANT_USER_ID
           value: workshop-user
       - name: ollama
@@ -62,7 +62,7 @@ spec:
         - name: OLLAMA_NUM_PARALLEL
           value: "2"
         - name: OLLAMA_MODEL
-          value: gemma2:9b
+          value: gemma3:1b
         command:
         - /bin/sh
         - -c
