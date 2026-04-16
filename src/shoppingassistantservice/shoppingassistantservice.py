@@ -20,7 +20,6 @@ CART_SERVICE_ADDR = os.getenv("CART_SERVICE_ADDR", "cartservice:7070")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
 OLLAMA_TAGS_URL = os.getenv("OLLAMA_TAGS_URL", "http://127.0.0.1:11434/api/tags")
 MODEL_NAME = os.getenv("MODEL_NAME", "gemma3:1b-it-qat")
-USER_ID = os.getenv("SHOPPING_ASSISTANT_USER_ID", "workshop-user")
 
 catalog_stub = demo_pb2_grpc.ProductCatalogServiceStub(
     grpc.insecure_channel(PRODUCT_CATALOG_SERVICE_ADDR)
@@ -114,8 +113,11 @@ def get_product_details(product_id):
         return None
 
 
-def get_cart():
-    cart = cart_stub.GetCart(demo_pb2.GetCartRequest(user_id=USER_ID))
+def get_cart(user_id):
+    try:
+        cart = cart_stub.GetCart(demo_pb2.GetCartRequest(user_id=user_id))
+    except grpc.RpcError:
+        return []
     summary = []
     for item in cart.items:
         product = get_product_details(item.product_id)
@@ -130,10 +132,10 @@ def get_cart():
     return summary
 
 
-def add_to_cart(product_id, quantity=1):
+def add_to_cart(user_id, product_id, quantity=1):
     cart_stub.AddItem(
         demo_pb2.AddItemRequest(
-            user_id=USER_ID,
+            user_id=user_id,
             item=demo_pb2.CartItem(product_id=product_id, quantity=quantity),
         )
     )
@@ -185,11 +187,11 @@ def normalize_message(payload):
     return str(payload.get("message", "")).strip()
 
 
-def get_tool_summary(matches):
+def get_tool_summary(matches, session_id):
     return json.dumps(
         {
             "matching_products": matches,
-            "cart": get_cart(),
+            "cart": get_cart(session_id),
         },
         indent=2,
     )
@@ -202,7 +204,7 @@ def handle_confirmation(session_id, lowered):
         return respond("I do not have a pending cart action to confirm right now.")
 
     action = pending_actions.pop(session_id)
-    result = add_to_cart(action["product_id"], action["quantity"])
+    result = add_to_cart(session_id, action["product_id"], action["quantity"])
     record_action(session_id, "add_to_cart", action["product_id"])
     return respond(
         f"Added {result['quantity']} x {action['name']} to your cart.",
@@ -221,7 +223,7 @@ def handle_cart_query(session_id, lowered):
     ):
         return None
 
-    cart_items = get_cart()
+    cart_items = get_cart(session_id)
     record_action(session_id, "get_cart", f"{len(cart_items)} items")
     if not cart_items:
         return respond("Your cart is empty right now.")
@@ -280,7 +282,7 @@ def handle_search_or_recommendation(session_id, user_input):
         return respond("I could not find a matching product in the live catalog.")
 
     try:
-        answer = call_model(user_input, get_tool_summary(matches))
+        answer = call_model(user_input, get_tool_summary(matches, session_id))
         record_action(session_id, "call_model", MODEL_NAME)
     except Exception:
         top = matches[0]
